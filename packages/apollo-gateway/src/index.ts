@@ -76,6 +76,10 @@ export type GatewayConfig =
   | LocalGatewayConfig
   | ManagedGatewayConfig;
 
+type DataSourceCache = {
+  [serviceName: string]: { url?: string; dataSource: GraphQLDataSource };
+};
+
 function isLocalConfig(config: GatewayConfig): config is LocalGatewayConfig {
   return 'localServiceList' in config;
 }
@@ -96,7 +100,7 @@ export type Experimental_DidResolveQueryPlanCallback = ({
   operationContext,
 }: {
   readonly queryPlan: QueryPlan;
-  readonly serviceMap: ServiceMap;
+  readonly serviceMap: DataSourceCache;
   readonly operationContext: OperationContext;
 }) => void;
 
@@ -141,7 +145,7 @@ type RequestContext<TContext> = WithRequired<
 
 export class ApolloGateway implements GraphQLService {
   public schema?: GraphQLSchema;
-  protected serviceMap: ServiceMap = Object.create(null);
+  protected serviceMap: DataSourceCache = Object.create(null);
   protected config: GatewayConfig;
   protected logger: Logger;
   protected queryPlanStore?: InMemoryLRUCache<QueryPlan>;
@@ -209,7 +213,9 @@ export class ApolloGateway implements GraphQLService {
         config.experimental_didFailComposition;
       this.experimental_didUpdateComposition =
         config.experimental_didUpdateComposition;
-      this.experimental_pollIntervalSeconds = config.experimental_pollIntervalSeconds || this.experimental_pollIntervalSeconds ;
+      this.experimental_pollIntervalSeconds =
+        config.experimental_pollIntervalSeconds ||
+        this.experimental_pollIntervalSeconds;
 
       // Warn against using the pollInterval and a serviceList simulatenously
       if (config.experimental_pollIntervalSeconds && isRemoteConfig(config)) {
@@ -272,12 +278,10 @@ export class ApolloGateway implements GraphQLService {
     this.schema = this.createSchema(result.serviceDefinitions);
 
     if (this.queryPlanStore) this.queryPlanStore.flush();
-      this.logger.debug('Gateway config has changed, updating schema');
+    this.logger.debug('Gateway config has changed, updating schema');
 
     try {
-      this.onSchemaChangeListeners.forEach(listener =>
-        listener(this.schema!),
-      );
+      this.onSchemaChangeListeners.forEach(listener => listener(this.schema!));
     } catch (e) {
       this.logger.warn(
         'Error notifying schema change listener of update to schema.',
@@ -403,8 +407,11 @@ export class ApolloGateway implements GraphQLService {
     serviceDef: ServiceEndpointDefinition,
   ): GraphQLDataSource {
     // If the DataSource has already been created, early return
-    if (this.serviceMap[serviceDef.name])
-      return this.serviceMap[serviceDef.name];
+    if (
+      this.serviceMap[serviceDef.name] &&
+      serviceDef.url === this.serviceMap[serviceDef.name].url
+    )
+      return this.serviceMap[serviceDef.name].dataSource;
 
     if (!serviceDef.url && !isLocalConfig(this.config)) {
       throw new Error(
@@ -419,7 +426,7 @@ export class ApolloGateway implements GraphQLService {
         });
 
     // Cache the created DataSource
-    this.serviceMap[serviceDef.name] = dataSource;
+    this.serviceMap[serviceDef.name] = { url: serviceDef.url, dataSource };
 
     return dataSource;
   }
@@ -529,7 +536,13 @@ export class ApolloGateway implements GraphQLService {
 
     const response = await executeQueryPlan<TContext>(
       queryPlan,
-      this.serviceMap,
+      Object.entries(this.serviceMap).reduce(
+        (accumulator, [name, { dataSource }]) => {
+          accumulator[name] = dataSource;
+          return accumulator;
+        },
+        {} as ServiceMap,
+      ),
       requestContext,
       operationContext,
     );
